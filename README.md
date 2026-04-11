@@ -40,11 +40,15 @@ Welcome to the Real-Time Sign Language Interpreter! This project uses machine le
    source .venv/bin/activate
    ```
 
-3. Install the required Python packages:
+3. Install the required Python packages (API + sign detection; **no matplotlib/JAX** — avoids building C extensions without Visual Studio):
 
    ```
    pip install -r requirements.txt
    ```
+
+   Use **Python 3.11 or 3.12** if TensorFlow or other packages report “no matching distribution”.
+
+   Optional desktop audio (`letter_interpreter.py`): `pip install -r requirements-optional-tools.txt`
 
 4. Run the interpreter scripts:
 
@@ -57,6 +61,78 @@ Welcome to the Real-Time Sign Language Interpreter! This project uses machine le
      ```
      python word_interpreter.py
      ```
+
+## Web Dashboard (React + Tailwind + TypeScript)
+
+This project now includes a modern frontend dashboard in `frontend/` that is wired to a Python API (`api_server.py`) for process control.
+
+### Backend API setup
+
+1. Activate your virtual environment.
+2. Start the API server:
+
+   ```
+   python api_server.py
+   ```
+
+3. The API runs on `http://127.0.0.1:5000` by default.
+   You can change host/port:
+
+   ```
+   $env:API_HOST="127.0.0.1"
+   $env:API_PORT="5000"
+   python api_server.py
+   ```
+
+### Sign detection (which model runs?)
+
+The API picks a detector automatically:
+
+1. **Keypoint TFLite (recommended)** — If `supportbackend/American-Sign-Language-Detection/model/keypoint_classifier/keypoint_classifier.tflite` and `keypoint_classifier_label.csv` exist **and** TensorFlow (or `tflite-runtime`) loads, the server uses the same pipeline as that project: MediaPipe → wrist-relative normalized landmarks → TFLite (ASL **A–Z**). `requirements.txt` includes **`tensorflow`** (works on most Windows/macOS/Linux with **Python 3.11–3.12**). If TensorFlow has no wheel for your Python version, install **`tflite-runtime`** when available, or rely on the sklearn fallback below.
+
+2. **Sklearn legacy** — If the keypoint bundle is missing or fails to load, the API uses `letter_model.joblib` (or trains from `hand_signals.csv` on first run).
+
+Force the sklearn path only:
+
+```
+$env:USE_LEGACY_SIGN_MODEL="1"
+python api_server.py
+```
+
+The web UI shows **Detector:** … under Sign → English. `/api/status` and `/api/health` include `sign_detector`: `keypoint_tflite` | `sklearn_legacy` | `loading` | `failed`.
+
+### Frontend setup
+
+1. Open a second terminal and go to the frontend folder:
+
+   ```
+   cd frontend
+   npm install
+   ```
+
+2. **API URL (dev):** With `npm run dev`, the app calls same-origin `/api` and Vite proxies to Flask on port 5000 (`frontend/vite.config.ts`). You do **not** need a `.env` file unless you want a custom backend URL.
+
+   Optional `.env` in `frontend/`:
+
+   ```
+   VITE_API_BASE_URL=http://127.0.0.1:5000
+   ```
+
+3. Start the frontend:
+
+   ```
+   npm run dev
+   ```
+
+4. Open the URL shown by Vite (usually `http://127.0.0.1:5173`).
+
+### Dashboard capabilities
+
+- **Sign → English:** start/stop letter or word camera session; live browser camera; model confidence and translation text.
+- **English → Sign:** type English text and load **ASL manual alphabet** (finger spelling) reference images via `/api/text-to-sign` (Wikimedia Commons URLs resolved on the server).
+- Inspect recent backend logs.
+
+Finger spelling is a reference view only; full ASL uses different grammar, and letters **J** and **Z** are normally produced with motion.
 
 ### Usage
 

@@ -1,0 +1,9 @@
+# Optional: desktop scripts (not required for api_server.py or the React app)
+# pip install -r requirements-optional-tools.txt
+
+gTTS>=2.5.0
+pygame>=2.5.0
+
+# Only if you run notebooks or code that plots (e.g. training viz). Needs MSVC on Windows
+# if no wheel exists for your Python version:
+# matplotlib>=3.8.0

@@ -81,40 +81,28 @@ class handDetector():
         all_landmarks (list): A list of lists containing the id and coordiantes (x, y) of each hand landmark for each hand
         '''
 
-        #Initialize lists for all the landmarks
         all_landmarks = []
-        
-        #Checks for hands in the image
-        if self.results.multi_hand_landmarks and self.results.multi_handedness:
-            
-            #Loops through each detected hand
-            for hand_num in range(len(self.results.multi_handedness)):
+        if not self.results.multi_hand_landmarks:
+            return all_landmarks
 
-                #Gathers the handedness for of each detected hand
-                hand = self.results.multi_hand_landmarks[hand_num]
-                handedness = self.results.multi_handedness[hand_num].classification
+        height, width = img.shape[0], img.shape[1]
 
-                #Loops through each classification for each hand
-                for classification in handedness:
-                    
-                    #Initialize individual list for hand landmarks
-                    landmark_list = []
+        for hand_num, hand in enumerate(self.results.multi_hand_landmarks):
+            landmark_list = []
+            for id, landmark in enumerate(hand.landmark):
+                center_x = int(landmark.x * width)
+                center_y = int(landmark.y * height)
+                landmark_list.append([id, center_x, center_y])
+                if draw:
+                    cv2.circle(img, (center_x, center_y), 5, (255, 255, 255), cv2.FILLED)
 
-                    #Enumerates through each id and landmark
-                    for id, landmark in enumerate(hand.landmark):
+            label = "Right"
+            if self.results.multi_handedness and hand_num < len(
+                self.results.multi_handedness
+            ):
+                cls = self.results.multi_handedness[hand_num].classification
+                if cls:
+                    label = cls[0].label
+            all_landmarks.append((label, landmark_list))
 
-                        #Calculates the coordinates of each landmark in comparison to the size of the image window
-                        height, width, center = img.shape
-                        center_x, center_y = int(landmark.x*width), int(landmark.y*height)
-                        
-                        #Adds the id and coordinates to the landmark list
-                        landmark_list.append([id, center_x, center_y])
-                        
-                        #Optionally draws the location of each landmark
-                        if draw:
-                            cv2.circle(img, (center_x,center_y), 5, (255,255,255), cv2.FILLED)
-                    
-                    #Adds the handedness and landmark list to the larger list of landmarks
-                    all_landmarks.append((classification.label, landmark_list))
-        
         return all_landmarks
