@@ -30,6 +30,24 @@ except ImportError:  # pragma: no cover
     tf = None
 
 
+def _solutions_module():
+    """
+    MediaPipe package layouts differ by build:
+    - classic: mediapipe.solutions (via mp.solutions)
+    - some newer/minimal wheels: mediapipe.python.solutions only
+    """
+    sol = getattr(mp, "solutions", None)
+    if sol is not None:
+        return sol
+    try:
+        import mediapipe.python.solutions as mp_solutions  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "MediaPipe solutions API is unavailable in this environment."
+        ) from exc
+    return mp_solutions
+
+
 def _asl_bundle_root(repo_root: Path) -> Path:
     return repo_root / "supportbackend" / "American-Sign-Language-Detection"
 
@@ -103,7 +121,8 @@ class KeypointAslEngine:
         self._in_idx = self._interpreter.get_input_details()[0]["index"]
         self._out_idx = self._interpreter.get_output_details()[0]["index"]
 
-        self._hands = mp.solutions.hands.Hands(
+        solutions = _solutions_module()
+        self._hands = solutions.hands.Hands(
             static_image_mode=True,
             max_num_hands=1,
             min_detection_confidence=0.7,

@@ -24,6 +24,7 @@ pip-delete-this-directory.txt
 htmlcov/
 .tox/
 .nox/
+.venv311
 .coverage
 .coverage.*
 .cache
@@ -64,3 +65,15 @@ dmypy.json
 
 #Pickle files
 *.pkl
+
+# Trained letter classifier (regenerated on first run if missing)
+letter_model.joblib
+
+# Frontend is a separate repository; nested .git causes "embedded git repository"
+KSLfinaly/
+
+# Large local ASL image dataset (optional; use prepare_ksldata_landmarks.py)
+ksldata/
+
+# Windows shortcuts / junk
+*.lnk

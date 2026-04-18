@@ -4,16 +4,22 @@
 
 Flask>=3.0.3,<4
 flask-cors>=4.0.1
-numpy>=1.26.4,<2.1
+# NumPy <2.1 has no cp314 wheel; use newer NumPy on Python 3.14+.
+numpy>=1.26.4,<2.1; python_version < "3.14"
+numpy>=2.1.0; python_version >= "3.14"
 pandas>=2.0.0
 scikit-learn>=1.4.0
 scipy>=1.11.0
 joblib>=1.3.0
 opencv-python>=4.8.0,<5
-mediapipe==0.10.14
+# mediapipe 0.10.14 has no Python 3.13+ wheels; use newer builds there.
+mediapipe==0.10.14; python_version < "3.13"
+mediapipe>=0.10.30; python_version >= "3.13"
 Pillow>=10.0.0
 protobuf>=4.25.3,<5
 requests>=2.31.0
+pymongo>=4.8.0
 
-# Keypoint ASL (supportbackend .tflite). Comment out if install fails; API falls back to sklearn.
-tensorflow>=2.15.0,<2.18.0
+# Keypoint ASL (.tflite) support. TensorFlow wheels are generally unavailable on Python 3.13+.
+# On newer Python, API still works via sklearn fallback if TF isn't installed.
+tensorflow>=2.15.0,<2.18.0; python_version < "3.13"

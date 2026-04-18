@@ -1,6 +1,25 @@
 import cv2
 import mediapipe as mp
 
+
+def _solutions_module():
+    """
+    MediaPipe package layouts differ by build:
+    - classic: mediapipe.solutions (via mp.solutions)
+    - some newer/minimal wheels: mediapipe.python.solutions only
+    """
+    sol = getattr(mp, "solutions", None)
+    if sol is not None:
+        return sol
+    try:
+        import mediapipe.python.solutions as mp_solutions  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "MediaPipe solutions API is unavailable in this environment."
+        ) from exc
+    return mp_solutions
+
+
 class handDetector():
     '''
     A class for detecting and tracking hands in real-time video using MediaPipe
@@ -35,14 +54,15 @@ class handDetector():
         self.presence_con = presence_con
         self.track_con = track_con
         
-        self.mp_hands = mp.solutions.hands
+        solutions = _solutions_module()
+        self.mp_hands = solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=self.mode,
             max_num_hands=self.max_hands,
             min_detection_confidence=self.detection_con,
             min_tracking_confidence=self.track_con
         )
-        self.mp_draw =  mp.solutions.drawing_utils
+        self.mp_draw = solutions.drawing_utils
 
 
     def find_hands(self, img, draw=True):

@@ -29,6 +29,32 @@ Welcome to the Real-Time Sign Language Interpreter! This project uses machine le
 ## Getting Started
 ### Installation
 
+### Windows quick start (recommended, stable)
+
+Use this flow to avoid MediaPipe / Python-version mismatch errors:
+
+1. Create a dedicated Python 3.11 environment:
+
+   ```
+   py -3.11 -m venv .venv311
+   .\.venv311\Scripts\activate
+   ```
+
+2. Install dependencies:
+
+   ```
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+3. Start backend (always from this env):
+
+   ```
+   .\start_backend.ps1
+   ```
+
+If you see repeated `503` on `/api/status` or `/api/prediction`, first ensure port `5000` is served by `.venv311` and not another Python environment.
+
 1. Clone the repository:
 
    ```
@@ -68,11 +94,11 @@ This project now includes a modern frontend dashboard in `frontend/` that is wir
 
 ### Backend API setup
 
-1. Activate your virtual environment.
+1. Activate the correct virtual environment (`.venv311` recommended on Windows).
 2. Start the API server:
 
    ```
-   python api_server.py
+   .\start_backend.ps1
    ```
 
 3. The API runs on `http://127.0.0.1:5000` by default.
