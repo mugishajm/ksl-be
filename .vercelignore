@@ -1,0 +1,27 @@
+.git/
+.github/
+.cursor/
+.vercel/
+
+# Local Python environments and caches
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large local datasets/assets not needed at runtime
+ksldata/
+KSLfinaly/
+supportbackend/
+*.csv
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local/dev only
+node_modules/
+frontend/
+debug.log

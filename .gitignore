@@ -77,3 +77,4 @@ ksldata/
 
 # Windows shortcuts / junk
 *.lnk
+.vercel
