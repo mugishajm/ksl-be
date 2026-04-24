@@ -29,7 +29,6 @@ else:
 
 ROOT = Path(__file__).resolve().parent
 MODEL_CACHE = ROOT / "letter_model.joblib"
-KSLDATA_LANDMARK_CSV = ROOT / "hand_signals_ksldata.csv"
 
 # Landmark features are pixel x,y; scale must match training (typical webcam ~640×480).
 INFERENCE_FRAME_W = 640
@@ -223,29 +222,7 @@ def load_letter_model() -> Pipeline:
     if "letter" not in base_data.columns:
         raise RuntimeError("hand_signals.csv is missing required 'letter' column.")
 
-    datasets = [base_data]
-    if KSLDATA_LANDMARK_CSV.exists():
-        try:
-            ksldata = pd.read_csv(KSLDATA_LANDMARK_CSV)
-            ksldata = ksldata.loc[:, ~ksldata.columns.str.contains("^Unnamed")]
-            if "letter" in ksldata.columns:
-                keep_cols = [c for c in base_data.columns if c in ksldata.columns]
-                if "letter" in keep_cols and len(keep_cols) >= 43:
-                    ksldata = ksldata[keep_cols]
-                    datasets.append(ksldata)
-                    add_log(
-                        f"Using additional KSL data: {KSLDATA_LANDMARK_CSV.name} ({len(ksldata)} rows)."
-                    )
-                else:
-                    add_log(
-                        f"Skipped {KSLDATA_LANDMARK_CSV.name}: incompatible landmark columns."
-                    )
-            else:
-                add_log(f"Skipped {KSLDATA_LANDMARK_CSV.name}: no 'letter' column.")
-        except Exception as exc:
-            add_log(f"Skipped {KSLDATA_LANDMARK_CSV.name}: {exc}")
-
-    data = pd.concat(datasets, ignore_index=True)
+    data = base_data
     x_data = data.drop("letter", axis=1).astype(np.float32)
     y_data = data["letter"].astype(str).str.lower()
 

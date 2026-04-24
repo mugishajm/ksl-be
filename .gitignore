@@ -74,9 +74,6 @@ letter_model.joblib
 # Frontend is a separate repository; nested .git causes "embedded git repository"
 KSLfinaly/
 
-# Large local ASL image dataset (optional; use prepare_ksldata_landmarks.py)
-ksldata/
-
 # Windows shortcuts / junk
 *.lnk
 .vercel
