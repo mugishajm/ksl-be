@@ -84,12 +84,12 @@ def add_log(message: str) -> None:
 
 
 def _mongo_enabled() -> bool:
-    return bool(os.getenv("DATABASE_URL", "mongodb+srv://mugisha:12345@cluster-1.23wtfmw.mongodb.net/ksl1?appName=Cluster-1").strip())
+    return bool(os.getenv("DATABASE_URL", "").strip())
 
 
 def _db():
     global _mongo_client
-    uri = os.getenv("DATABASE_URL", "mongodb+srv://mugisha:12345@cluster-1.23wtfmw.mongodb.net/ksl1?appName=Cluster-1").strip()
+    uri = os.getenv("DATABASE_URL", "").strip()
     if not uri:
         return None
     if _mongo_client is None:

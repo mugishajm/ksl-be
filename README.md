@@ -110,6 +110,22 @@ This project now includes a modern frontend dashboard in `frontend/` that is wir
    python api_server.py
    ```
 
+### Render deployment notes (backend)
+
+If login works but sign detection fails with `MediaPipe solutions API is unavailable in this environment`, deploy with Python 3.11:
+
+1. This repo includes `runtime.txt` with `python-3.11.9`.
+2. In Render environment variables, set:
+   - `DATABASE_URL=<your Mongo URI>`
+   - `USE_LEGACY_SIGN_MODEL=1` (optional fallback if keypoint/MediaPipe path fails)
+3. Start command:
+
+   ```
+   python api_server.py
+   ```
+
+`api_server.py` is configured to bind to `0.0.0.0:$PORT` automatically on hosted platforms.
+
 ### Sign detection (which model runs?)
 
 The API picks a detector automatically:
