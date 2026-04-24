@@ -54,7 +54,18 @@ LETTER_STABILITY_WINDOW = 5
 LETTER_STABILITY_MIN_COUNT = 3
 
 app = Flask(__name__)
-CORS(app)
+_CORS_ORIGINS = [
+    "https://ksl-pied.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": _CORS_ORIGINS}},
+    supports_credentials=True,
+)
 
 logs: Deque[str] = deque(maxlen=400)
 _mongo_client: Optional[MongoClient] = None
@@ -73,12 +84,12 @@ def add_log(message: str) -> None:
 
 
 def _mongo_enabled() -> bool:
-    return bool(os.getenv("DATABASE_URL", "").strip())
+    return bool(os.getenv("DATABASE_URL", "mongodb+srv://mugisha:12345@cluster-1.23wtfmw.mongodb.net/ksl1?appName=Cluster-1").strip())
 
 
 def _db():
     global _mongo_client
-    uri = os.getenv("DATABASE_URL", "").strip()
+    uri = os.getenv("DATABASE_URL", "mongodb+srv://mugisha:12345@cluster-1.23wtfmw.mongodb.net/ksl1?appName=Cluster-1").strip()
     if not uri:
         return None
     if _mongo_client is None:
@@ -1351,7 +1362,14 @@ def translate_detected() -> tuple[str, int]:
 
 
 if __name__ == "__main__":
-    host = os.getenv("API_HOST", "127.0.0.1")
-    port = int(os.getenv("API_PORT", "5000"))
+    # Hosted platforms (Render/Fly/etc.) require binding to 0.0.0.0 and the
+    # platform-provided PORT environment variable.
+    port_env = os.getenv("PORT")
+    host = "0.0.0.0" if port_env else os.getenv("API_HOST", "0.0.0.0")
+    port_raw = port_env or os.getenv("API_PORT", "5000")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 5000
     debug = os.getenv("API_DEBUG", "0") == "1"
     app.run(host=host, port=port, debug=debug, threaded=True, use_reloader=False)
