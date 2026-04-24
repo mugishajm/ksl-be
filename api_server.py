@@ -11,24 +11,20 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Deque, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple, TYPE_CHECKING
 
-import cv2
-import joblib
-import numpy as np
-import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.collection import Collection
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from werkzeug.security import check_password_hash, generate_password_hash
 
-import hand_detector2 as hdm
+if TYPE_CHECKING:
+    from sklearn.pipeline import Pipeline
+else:
+    Pipeline = Any  # runtime typing only
 
 
 ROOT = Path(__file__).resolve().parent
@@ -65,6 +61,7 @@ _mongo_client: Optional[MongoClient] = None
 
 # Exposed in /api/status and /api/health when ready: keypoint_tflite | sklearn_legacy | failed
 SIGN_DETECTOR_KIND: str = "loading"
+_RUNNING_ON_VERCEL = bool(os.getenv("VERCEL", "").strip())
 
 
 def utc_now_iso() -> str:
@@ -196,6 +193,15 @@ def _record_admin_log(event_type: str, status: str, user: str = "system", durati
 
 
 def load_letter_model() -> Pipeline:
+    # Heavy dependencies are imported lazily so the module can be deployed in a
+    # "Vercel-lite" configuration without bundling large wheels.
+    import joblib
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
     if MODEL_CACHE.exists():
         model = joblib.load(MODEL_CACHE)
         add_log("Loaded cached letter model.")
@@ -266,6 +272,7 @@ class DetectionSession:
         self.keypoint_engine = keypoint_engine
         self.detector: Optional[hdm.handDetector] = None
         if legacy_model is not None:
+            import hand_detector2 as hdm
             self.detector = hdm.handDetector(
                 mode=True,
                 max_hands=1,
@@ -381,6 +388,9 @@ class DetectionSession:
         return max(0.0, min(held / AUTO_COMMIT_HOLD_SECONDS, 1.0))
 
     def process_frame(self, frame_bgr: np.ndarray) -> None:
+        import cv2
+        import numpy as np
+
         if not self.active:
             return
 
@@ -519,7 +529,15 @@ def _load_model_worker() -> None:
         _model_ready.set()
 
 
-threading.Thread(target=_load_model_worker, daemon=True, name="model-loader").start()
+if _RUNNING_ON_VERCEL:
+    _load_error = (
+        "Sign detection is disabled on Vercel because the required CV/ML "
+        "dependencies exceed the 500MB serverless storage limit."
+    )
+    SIGN_DETECTOR_KIND = "failed"
+    _model_ready.set()
+else:
+    threading.Thread(target=_load_model_worker, daemon=True, name="model-loader").start()
 
 
 def _backend_state() -> Tuple[Optional[DetectionSession], Optional[str], str]:
@@ -776,7 +794,7 @@ def reports_stats() -> tuple[str, int]:
     else:
         days = 30
     now = datetime.now(timezone.utc)
-    start = now - pd.Timedelta(days=days)
+    start = now - timedelta(days=days)
 
     active_users = 0
     if users_col is not None:
@@ -1084,6 +1102,18 @@ def stop() -> tuple[str, int]:
 
 @app.post("/api/analyze-frame")
 def analyze_frame() -> tuple[str, int]:
+    if _RUNNING_ON_VERCEL:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Frame analysis is disabled on Vercel (serverless storage limit). "
+                        "Deploy the ML backend to a container host."
+                    )
+                }
+            ),
+            501,
+        )
     sess, err, phase = _backend_state()
     if phase == "loading":
         return jsonify({"error": "Model is still loading."}), 503
@@ -1099,12 +1129,14 @@ def analyze_frame() -> tuple[str, int]:
         return jsonify({"error": "Invalid image payload."}), 400
 
     try:
+        import numpy as np
         encoded = frame_data.split(",", 1)[1]
         binary = base64.b64decode(encoded)
         decoded = np.frombuffer(binary, dtype=np.uint8)
     except Exception:
         return jsonify({"error": "Invalid image encoding."}), 400
 
+    import cv2
     frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
     if frame is None:
         return jsonify({"error": "Could not decode frame."}), 400
