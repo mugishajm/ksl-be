@@ -55,6 +55,7 @@ LETTER_STABILITY_MIN_COUNT = 3
 app = Flask(__name__)
 _CORS_ORIGINS = [
     "https://ksl-pied.vercel.app",
+    "https://sign-language-interpreter-pied.vercel.app",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:5000",
