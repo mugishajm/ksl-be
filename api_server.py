@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import threading
+import uuid
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -14,6 +15,7 @@ from collections import Counter
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Deque, Optional, Tuple, TYPE_CHECKING
 
 from flask import Flask, jsonify, request
@@ -479,6 +481,17 @@ class DetectionSession:
 _session: Optional[DetectionSession] = None
 _load_error: Optional[str] = None
 _model_ready = threading.Event()
+_sessions_lock = threading.Lock()
+
+
+@dataclass
+class SessionEntry:
+    sess: DetectionSession
+    last_seen: datetime
+
+
+_sessions: dict[str, SessionEntry] = {}
+_SESSION_TTL_SECONDS = 15 * 60
 
 
 def _try_keypoint_session() -> Optional[DetectionSession]:
@@ -551,6 +564,65 @@ def _backend_state() -> Tuple[Optional[DetectionSession], Optional[str], str]:
     return _session, None, "ready"
 
 
+def _new_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _get_session_id() -> str:
+    sid = request.headers.get("X-Session-Id", "").strip()
+    if not sid:
+        sid = request.args.get("session_id", "").strip()
+    if not sid:
+        sid = (request.get_json(silent=True) or {}).get("session_id", "")
+        sid = str(sid).strip()
+    return sid
+
+
+def _get_or_404_session() -> Tuple[Optional[DetectionSession], Optional[str], int]:
+    """
+    Returns (session, error_message, http_status).
+    """
+    sess, err, phase = _backend_state()
+    if phase == "loading":
+        return None, "Model is still loading.", 503
+    if phase == "failed":
+        return None, err or "Model failed to load.", 503
+    assert sess is not None
+    sid = _get_session_id()
+    if not sid:
+        return None, "Missing session_id. Call /api/start first.", 400
+    with _sessions_lock:
+        entry = _sessions.get(sid)
+        if entry is None:
+            return None, "Unknown or expired session_id. Call /api/start again.", 404
+        entry.last_seen = datetime.now(timezone.utc)
+        return entry.sess, None, 200
+
+
+def _cleanup_sessions_worker() -> None:
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            expired: list[str] = []
+            with _sessions_lock:
+                for sid, entry in list(_sessions.items()):
+                    age = (now - entry.last_seen).total_seconds()
+                    if age >= _SESSION_TTL_SECONDS:
+                        expired.append(sid)
+                for sid in expired:
+                    _sessions.pop(sid, None)
+            if expired:
+                add_log(f"Cleaned up {len(expired)} idle sessions.")
+        except Exception:
+            # Cleanup is best-effort; never crash the server.
+            pass
+        finally:
+            threading.Event().wait(60)
+
+
+threading.Thread(target=_cleanup_sessions_worker, daemon=True, name="session-cleaner").start()
+
+
 @app.get("/api/health")
 def health() -> tuple[str, int]:
     _, err, phase = _backend_state()
@@ -621,19 +693,52 @@ def status() -> tuple[str, int]:
             ),
             200,
         )
-    assert sess is not None
-    return (
-        jsonify(
-            {
-                "status": "running" if sess.active else "idle",
-                "mode": sess.mode,
-                "started_at": sess.started_at.isoformat() if sess.started_at else None,
-                "backend": "ready",
-                "sign_detector": SIGN_DETECTOR_KIND,
-            }
-        ),
-        200,
-    )
+    # Backend ready; session is per-user (requires session_id).
+    sid = _get_session_id()
+    if not sid:
+        return (
+            jsonify(
+                {
+                    "status": "idle",
+                    "mode": "letter",
+                    "started_at": None,
+                    "backend": "ready",
+                    "sign_detector": SIGN_DETECTOR_KIND,
+                    "needs_session": True,
+                }
+            ),
+            200,
+        )
+    with _sessions_lock:
+        entry = _sessions.get(sid)
+    if entry is None:
+        return (
+            jsonify(
+                {
+                    "status": "idle",
+                    "mode": "letter",
+                    "started_at": None,
+                    "backend": "ready",
+                    "sign_detector": SIGN_DETECTOR_KIND,
+                    "error": "Unknown or expired session_id. Start again.",
+                }
+            ),
+            200,
+        )
+    s = entry.sess
+    with s.lock:
+        return (
+            jsonify(
+                {
+                    "status": "running" if s.active else "idle",
+                    "mode": s.mode,
+                    "started_at": s.started_at.isoformat() if s.started_at else None,
+                    "backend": "ready",
+                    "sign_detector": SIGN_DETECTOR_KIND,
+                }
+            ),
+            200,
+        )
 
 
 @app.get("/api/logs")
@@ -950,8 +1055,38 @@ def complete_profile() -> tuple[str, int]:
 
 @app.get("/api/prediction")
 def get_prediction() -> tuple[str, int]:
-    sess, err, phase = _backend_state()
-    if phase == "loading":
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        # Keep UI polling stable: return 200 with backend info, but include error.
+        if code == 503 and err_msg == "Model is still loading.":
+            return (
+                jsonify(
+                    {
+                        "text": "",
+                        "current_letter": "",
+                        "confidence": 0.0,
+                        "status": "idle",
+                        "mode": "letter",
+                        "backend": "loading",
+                    }
+                ),
+                200,
+            )
+        if code == 503:
+            return (
+                jsonify(
+                    {
+                        "text": "",
+                        "current_letter": "",
+                        "confidence": 0.0,
+                        "status": "idle",
+                        "mode": "letter",
+                        "backend": "failed",
+                        "error": err_msg,
+                    }
+                ),
+                200,
+            )
         return (
             jsonify(
                 {
@@ -960,27 +1095,12 @@ def get_prediction() -> tuple[str, int]:
                     "confidence": 0.0,
                     "status": "idle",
                     "mode": "letter",
-                    "backend": "loading",
+                    "backend": "ready",
+                    "error": err_msg,
                 }
             ),
             200,
         )
-    if phase == "failed":
-        return (
-            jsonify(
-                {
-                    "text": "",
-                    "current_letter": "",
-                    "confidence": 0.0,
-                    "status": "idle",
-                    "mode": "letter",
-                    "backend": "failed",
-                    "error": err,
-                }
-            ),
-            200,
-        )
-    assert sess is not None
     with sess.lock:
         return (
             jsonify(
@@ -1001,12 +1121,9 @@ def get_prediction() -> tuple[str, int]:
 
 @app.post("/api/clear")
 def clear_prediction() -> tuple[str, int]:
-    sess, err, phase = _backend_state()
-    if phase == "loading":
-        return jsonify({"error": "Model is still loading."}), 503
-    if phase == "failed":
-        return jsonify({"error": err}), 503
-    assert sess is not None
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        return jsonify({"error": err_msg}), code
     sess.clear_text()
     return jsonify({"ok": True}), 200
 
@@ -1014,12 +1131,9 @@ def clear_prediction() -> tuple[str, int]:
 @app.post("/api/commit-letter")
 def commit_letter() -> tuple[str, int]:
     """Append the current detected letter to the transcript (manual, like tapping a key)."""
-    sess, err, phase = _backend_state()
-    if phase == "loading":
-        return jsonify({"error": "Model is still loading."}), 503
-    if phase == "failed":
-        return jsonify({"error": err}), 503
-    assert sess is not None
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        return jsonify({"error": err_msg}), code
     if not sess.active:
         return jsonify({"error": "Session is not running. Start the camera first."}), 409
     with sess.lock:
@@ -1047,12 +1161,9 @@ def commit_letter() -> tuple[str, int]:
 @app.post("/api/commit-space")
 def commit_space() -> tuple[str, int]:
     """Append a space to the transcript."""
-    sess, err, phase = _backend_state()
-    if phase == "loading":
-        return jsonify({"error": "Model is still loading."}), 503
-    if phase == "failed":
-        return jsonify({"error": err}), 503
-    assert sess is not None
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        return jsonify({"error": err_msg}), code
     if not sess.active:
         return jsonify({"error": "Session is not running."}), 409
     with sess.lock:
@@ -1079,23 +1190,30 @@ def start() -> tuple[str, int]:
     mode = payload.get("mode", "letter")
     if mode not in {"letter", "word"}:
         return jsonify({"error": "Mode must be 'letter' or 'word'."}), 400
-    if sess.active:
-        return jsonify({"error": "Session already running."}), 409
-    if not sess.start(mode):
+    sid = _get_session_id() or _new_session_id()
+    # Create per-user session bound to the already-loaded model assets.
+    # We clone a new DetectionSession that shares the underlying model/engine references.
+    new_sess = DetectionSession(sess.legacy_model, sess.keypoint_engine)
+    if not new_sess.start(mode):
         return jsonify({"error": "Unable to start session."}), 500
-    return jsonify({"ok": True, "mode": mode}), 200
+    with _sessions_lock:
+        _sessions[sid] = SessionEntry(sess=new_sess, last_seen=datetime.now(timezone.utc))
+    return jsonify({"ok": True, "mode": mode, "session_id": sid}), 200
 
 
 @app.post("/api/stop")
 def stop() -> tuple[str, int]:
-    sess, err, phase = _backend_state()
-    if phase in ("loading", "failed"):
-        return jsonify({"ok": True, "was_running": False}), 200
-    assert sess is not None
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        # Stop should be idempotent for the UI.
+        return jsonify({"ok": True, "was_running": False, "error": err_msg}), 200
     if sess.active:
         sess.stop()
-        return jsonify({"ok": True, "was_running": True}), 200
-    return jsonify({"ok": True, "was_running": False}), 200
+    sid = _get_session_id()
+    if sid:
+        with _sessions_lock:
+            _sessions.pop(sid, None)
+    return jsonify({"ok": True, "was_running": True}), 200
 
 
 @app.post("/api/analyze-frame")
@@ -1112,12 +1230,9 @@ def analyze_frame() -> tuple[str, int]:
             ),
             501,
         )
-    sess, err, phase = _backend_state()
-    if phase == "loading":
-        return jsonify({"error": "Model is still loading."}), 503
-    if phase == "failed":
-        return jsonify({"error": err}), 503
-    assert sess is not None
+    sess, err_msg, code = _get_or_404_session()
+    if sess is None:
+        return jsonify({"error": err_msg}), code
     if not sess.active:
         return jsonify({"error": "Session is not running."}), 409
 

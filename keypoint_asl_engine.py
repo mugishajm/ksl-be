@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import csv
 import itertools
+import threading
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -120,6 +121,9 @@ class KeypointAslEngine:
         self._interpreter.allocate_tensors()
         self._in_idx = self._interpreter.get_input_details()[0]["index"]
         self._out_idx = self._interpreter.get_output_details()[0]["index"]
+        # MediaPipe Hands + TFLite interpreter are not guaranteed to be thread-safe.
+        # Serialize inference so multiple user sessions can share one engine safely.
+        self._lock = threading.Lock()
 
         solutions = _solutions_module()
         self._hands = solutions.hands.Hands(
@@ -139,30 +143,31 @@ class KeypointAslEngine:
         frame_bgr: already flipped + resized to (frame_w, frame_h).
         Returns (letter_lowercase, confidence in [0,1]).
         """
-        image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image_rgb.flags.writeable = False
-        results = self._hands.process(image_rgb)
-        image_rgb.flags.writeable = True
+        with self._lock:
+            image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
+            results = self._hands.process(image_rgb)
+            image_rgb.flags.writeable = True
 
-        if not results.multi_hand_landmarks:
-            return "", 0.0
+            if not results.multi_hand_landmarks:
+                return "", 0.0
 
-        hand_landmarks = results.multi_hand_landmarks[0]
-        landmark_list = calc_landmark_list(frame_bgr, hand_landmarks)
-        processed = pre_process_landmark(landmark_list)
-        if len(processed) != 42:
-            return "", 0.0
+            hand_landmarks = results.multi_hand_landmarks[0]
+            landmark_list = calc_landmark_list(frame_bgr, hand_landmarks)
+            processed = pre_process_landmark(landmark_list)
+            if len(processed) != 42:
+                return "", 0.0
 
-        inp = np.array([processed], dtype=np.float32)
-        self._interpreter.set_tensor(self._in_idx, inp)
-        self._interpreter.invoke()
-        out = np.squeeze(self._interpreter.get_tensor(self._out_idx))
+            inp = np.array([processed], dtype=np.float32)
+            self._interpreter.set_tensor(self._in_idx, inp)
+            self._interpreter.invoke()
+            out = np.squeeze(self._interpreter.get_tensor(self._out_idx))
 
-        if out.ndim == 0:
-            return "", 0.0
-        idx = int(np.argmax(out))
-        conf = float(np.max(out))
-        if not (0 <= idx < len(self._labels)):
-            return "", conf
-        letter = self._labels[idx].lower()
-        return letter, conf
+            if out.ndim == 0:
+                return "", 0.0
+            idx = int(np.argmax(out))
+            conf = float(np.max(out))
+            if not (0 <= idx < len(self._labels)):
+                return "", conf
+            letter = self._labels[idx].lower()
+            return letter, conf
