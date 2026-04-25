@@ -56,26 +56,18 @@ LETTER_STABILITY_WINDOW = 5
 LETTER_STABILITY_MIN_COUNT = 3
 
 app = Flask(__name__)
-_CORS_ORIGINS = [
-    "https://ksl-pied.vercel.app",
-    "https://sign-language-interpreter-pied.vercel.app",
-    "https://ksl-be-ftj9.onrender.com",
-    re.compile(r"^https://[a-z0-9-]+\.vercel\.app$"),
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
-]
+# CORS: this API is called from multiple deployed frontends (Vercel, local dev, etc).
+# We don't rely on cookies; auth is via bearer tokens, so we can safely allow any origin.
 CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": _CORS_ORIGINS,
+            "origins": "*",
             "methods": ["GET", "POST", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Session-Id"],
         }
     },
-    supports_credentials=True,
+    supports_credentials=False,
 )
 
 logs: Deque[str] = deque(maxlen=400)
