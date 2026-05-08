@@ -1,12 +1,13 @@
 # --- Web API + camera sign detection (api_server.py, keypoint_asl_engine.py) ---
 # Use Python 3.11 or 3.12 for reliable pre-built wheels (TensorFlow, MediaPipe, OpenCV).
 # Avoid 3.13+ unless you know wheels exist for your platform.
+# This project is not supported on Python 3.14+ on Windows because core deps (NumPy/Pandas)
+# may require a native compiler toolchain and will fail to install.
 
 Flask>=3.0.3,<4
 flask-cors>=4.0.1
-# NumPy <2.1 has no cp314 wheel; use newer NumPy on Python 3.14+.
+# NumPy + OpenCV baseline (supported on Python 3.11–3.13).
 numpy>=1.26.4,<2.1; python_version < "3.14"
-numpy>=2.1.0; python_version >= "3.14"
 pandas>=2.0.0
 scikit-learn>=1.4.0
 scipy>=1.11.0

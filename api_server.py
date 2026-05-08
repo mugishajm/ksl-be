@@ -8,6 +8,7 @@ import secrets
 import threading
 import uuid
 import unicodedata
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,14 @@ else:
 
 ROOT = Path(__file__).resolve().parent
 MODEL_CACHE = ROOT / "letter_model.joblib"
+
+# Fail fast on unsupported Python versions to avoid confusing NumPy/OpenCV build errors.
+if sys.version_info >= (3, 14):
+    raise RuntimeError(
+        "Unsupported Python version for this project. "
+        "Use Python 3.11 or 3.12 (3.13 may work). "
+        f"Detected: {sys.version.split()[0]}"
+    )
 
 # Landmark features are pixel x,y; scale must match training (typical webcam ~640×480).
 INFERENCE_FRAME_W = 640
