@@ -468,19 +468,22 @@ class DetectionSession:
         if not self.active:
             return
 
-        with self.lock:
-            # Match `letter_interpreter.py` / supportbackend: mirrored webcam (selfie view).
-            frame_bgr = cv2.flip(frame_bgr, 1)
-            frame_bgr = cv2.resize(
-                frame_bgr,
-                (INFERENCE_FRAME_W, INFERENCE_FRAME_H),
-                interpolation=cv2.INTER_AREA,
-            )
+        # Match `letter_interpreter.py` / supportbackend: mirrored webcam (selfie view).
+        frame_bgr = cv2.flip(frame_bgr, 1)
+        frame_bgr = cv2.resize(
+            frame_bgr,
+            (INFERENCE_FRAME_W, INFERENCE_FRAME_H),
+            interpolation=cv2.INTER_AREA,
+        )
 
-            if self.keypoint_engine is not None:
-                letter, max_prob = self.keypoint_engine.predict_frame(
-                    frame_bgr, INFERENCE_FRAME_W, INFERENCE_FRAME_H
-                )
+        if self.keypoint_engine is not None:
+            # Shared engine serializes internally; do not hold per-session lock during inference.
+            letter, max_prob = self.keypoint_engine.predict_frame(
+                frame_bgr, INFERENCE_FRAME_W, INFERENCE_FRAME_H
+            )
+            with self.lock:
+                if not self.active:
+                    return
                 if not letter:
                     self._handle_detection_miss(max_prob)
                     return
@@ -508,8 +511,9 @@ class DetectionSession:
                     self.letter_buffer = [stable_letter]
                 if len(self.letter_buffer) >= LETTER_COMMIT_STREAK:
                     self._update_hold_and_maybe_commit(stable_letter)
-                return
+            return
 
+        with self.lock:
             assert self.legacy_model is not None and self.detector is not None
             processed = self.detector.find_hands(frame_bgr, draw=False)
             landmarks = self.detector.find_position(processed, draw=False)
@@ -552,6 +556,7 @@ class DetectionSession:
                 self._update_hold_and_maybe_commit(stable_letter)
 
 
+# Shared model + MediaPipe/TFLite engine (one process-wide instance). Per-user state lives in _sessions.
 _session: Optional[DetectionSession] = None
 _load_error: Optional[str] = None
 _model_ready = threading.Event()
@@ -567,8 +572,9 @@ class SessionEntry:
 
 
 _sessions: dict[str, SessionEntry] = {}
-_SESSION_TTL_SECONDS = 15 * 60
-_MAX_ACTIVE_SESSIONS = _env_int("MAX_ACTIVE_SESSIONS", 80)
+_SESSION_TTL_SECONDS = _env_int("SESSION_TIMEOUT_SECONDS", 15 * 60)
+# Cap concurrent inference sessions (alias MAX_SESSIONS for ops docs).
+_MAX_ACTIVE_SESSIONS = _env_int("MAX_ACTIVE_SESSIONS", _env_int("MAX_SESSIONS", 100))
 _MIN_FRAME_INTERVAL_SECONDS = _env_float("MIN_FRAME_INTERVAL_SECONDS", 0.14)
 _MAX_FRAME_BYTES = _env_int("MAX_FRAME_BYTES", 1_800_000)
 
@@ -677,6 +683,33 @@ def _get_session_id() -> str:
     return sid
 
 
+def _purge_expired_sessions() -> None:
+    """Remove TTL-expired sessions. Must be called with _sessions_lock held."""
+    now = datetime.now(timezone.utc)
+    expired: list[str] = []
+    for sid, entry in list(_sessions.items()):
+        age = (now - entry.last_seen).total_seconds()
+        if age >= _SESSION_TTL_SECONDS:
+            expired.append(sid)
+    for sid in expired:
+        ent = _sessions.pop(sid, None)
+        if ent is not None and ent.sess.active:
+            ent.sess.stop(session_id=sid)
+
+
+def _resume_session_hint_from_body() -> str:
+    """
+    Optional idempotency hint for POST /api/start ONLY (not from X-Session-Id).
+    Prevents stray headers from pinning new starts to stale or foreign ids.
+    """
+    payload = request.get_json(silent=True) or {}
+    for key in ("resume_session_id", "session_id"):
+        sid = str(payload.get(key, "")).strip()
+        if sid:
+            return sid
+    return ""
+
+
 def _get_or_404_session() -> Tuple[Optional[DetectionSession], Optional[str], int]:
     """
     Returns (session, error_message, http_status).
@@ -733,17 +766,12 @@ def _frame_gate_end(sid: str) -> None:
 def _cleanup_sessions_worker() -> None:
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            expired: list[str] = []
             with _sessions_lock:
-                for sid, entry in list(_sessions.items()):
-                    age = (now - entry.last_seen).total_seconds()
-                    if age >= _SESSION_TTL_SECONDS:
-                        expired.append(sid)
-                for sid in expired:
-                    _sessions.pop(sid, None)
-            if expired:
-                add_log(f"Cleaned up {len(expired)} idle sessions.")
+                before = len(_sessions)
+                _purge_expired_sessions()
+                removed = before - len(_sessions)
+            if removed:
+                add_log(f"Cleaned up {removed} idle sessions.")
         except Exception:
             # Cleanup is best-effort; never crash the server.
             pass
@@ -1186,6 +1214,16 @@ def complete_profile() -> tuple[str, int]:
 
 @app.get("/api/prediction")
 def get_prediction() -> tuple[str, int]:
+    sid = _get_session_id()
+    if not sid:
+        return (
+            jsonify(
+                {
+                    "error": "Missing session_id. Send X-Session-Id header or ?session_id=.",
+                }
+            ),
+            400,
+        )
     sess, err_msg, code = _get_or_404_session()
     if sess is None:
         # Keep UI polling stable: return 200 with backend info, but include error.
@@ -1321,10 +1359,14 @@ def start() -> tuple[str, int]:
     mode = payload.get("mode", "letter")
     if mode not in {"letter", "word"}:
         return jsonify({"error": "Mode must be 'letter' or 'word'."}), 400
-    sid = _get_session_id() or _new_session_id()
+    # Do NOT read X-Session-Id here: apiFetch always sends it and would pin every
+    # new browser to the same id. Only JSON body may resume an existing session.
+    hint = _resume_session_hint_from_body()
+    sid = hint or _new_session_id()
 
-    # Idempotent start: if this session is already active, return success.
     with _sessions_lock:
+        _purge_expired_sessions()
+        # Idempotent start: same client resumes with resume_session_id in body.
         existing = _sessions.get(sid)
         if existing is not None and existing.sess.active:
             existing.last_seen = datetime.now(timezone.utc)
@@ -1339,21 +1381,19 @@ def start() -> tuple[str, int]:
                 ),
                 200,
             )
+        if len(_sessions) >= _MAX_ACTIVE_SESSIONS:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "Server is busy. Too many active sessions right now. "
+                            "Please retry in a few seconds."
+                        )
+                    }
+                ),
+                429,
+            )
 
-    with _sessions_lock:
-        active_count = len(_sessions)
-    if active_count >= _MAX_ACTIVE_SESSIONS:
-        return (
-            jsonify(
-                {
-                    "error": (
-                        "Server is busy. Too many active sessions right now. "
-                        "Please retry in a few seconds."
-                    )
-                }
-            ),
-            429,
-        )
     # Create per-user session bound to the already-loaded model assets.
     # We clone a new DetectionSession that shares the underlying model/engine references.
     new_sess = DetectionSession(sess.legacy_model, sess.keypoint_engine)
@@ -1400,13 +1440,62 @@ def analyze_frame() -> tuple[str, int]:
             501,
         )
     sid = _get_session_id()
+    if not sid:
+        return (
+            jsonify(
+                {
+                    "error": "Missing session_id. Send X-Session-Id header, JSON session_id, or call /api/start first.",
+                    "hint": "Include session_id in JSON body or X-Session-Id header.",
+                }
+            ),
+            400,
+        )
+
+    data = request.get_json(silent=True)
+    if data is None:
+        return (
+            jsonify(
+                {
+                    "error": "Invalid or empty JSON body. Expected {\"image\": \"data:image/jpeg;base64,...\", \"session_id\": \"...\"}.",
+                }
+            ),
+            400,
+        )
+
+    frame_data = data.get("image")
+    if frame_data is None:
+        return (
+            jsonify(
+                {
+                    "error": "Missing image field. Send a data URL string in JSON key \"image\" (e.g. data:image/jpeg;base64,...).",
+                }
+            ),
+            400,
+        )
+    if not isinstance(frame_data, str):
+        return (
+            jsonify(
+                {
+                    "error": f"Invalid image type: expected string, got {type(frame_data).__name__}.",
+                }
+            ),
+            400,
+        )
+    if "," not in frame_data:
+        return (
+            jsonify(
+                {
+                    "error": "Invalid image format: expected data URL with a comma (data:image/jpeg;base64,...).",
+                }
+            ),
+            400,
+        )
+
     sess, err_msg, code = _get_or_404_session()
     if sess is None:
         return jsonify({"error": err_msg}), code
     if not sess.active:
         return jsonify({"error": "Session is not running."}), 409
-    if not sid:
-        return jsonify({"error": "Missing session_id. Call /api/start first."}), 400
 
     accepted, reason = _frame_gate_begin(sid)
     if not accepted:
@@ -1430,11 +1519,6 @@ def analyze_frame() -> tuple[str, int]:
             )
 
     try:
-        data = request.get_json(silent=True) or {}
-        frame_data = data.get("image")
-        if not isinstance(frame_data, str) or "," not in frame_data:
-            return jsonify({"error": "Invalid image payload."}), 400
-
         try:
             import numpy as np
             encoded = frame_data.split(",", 1)[1]
@@ -1452,13 +1536,28 @@ def analyze_frame() -> tuple[str, int]:
                     413,
                 )
             decoded = np.frombuffer(binary, dtype=np.uint8)
-        except Exception:
-            return jsonify({"error": "Invalid image encoding."}), 400
+        except Exception as exc:
+            return (
+                jsonify(
+                    {
+                        "error": "Invalid image encoding (base64 decode failed).",
+                        "detail": str(exc),
+                    }
+                ),
+                400,
+            )
 
         import cv2
         frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
         if frame is None:
-            return jsonify({"error": "Could not decode frame."}), 400
+            return (
+                jsonify(
+                    {
+                        "error": "Could not decode frame as image (imdecode returned None). Check JPEG/PNG data.",
+                    }
+                ),
+                400,
+            )
 
         sess.process_frame(frame)
         with sess.lock:
