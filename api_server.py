@@ -85,6 +85,31 @@ NO_DETECTION_GRACE_FRAMES = 5
 LETTER_STABILITY_WINDOW = 5
 LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 2)
 
+
+def _mirror_and_resize_bgr(frame_bgr: Any, w: int, h: int) -> Any:
+    """
+    Selfie mirror + resize to inference size.
+    Falls back to Pillow when OpenCV rejects NumPy buffers (broken cv2/numpy ABI on some Windows venvs).
+    """
+    import cv2
+    import numpy as np
+
+    try:
+        out = cv2.flip(frame_bgr, 1)
+        return cv2.resize(out, (w, h), interpolation=cv2.INTER_AREA)
+    except cv2.error:
+        from PIL import Image
+
+        arr = np.asarray(frame_bgr, dtype=np.uint8)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError("expected HxWx3 BGR frame") from None
+        rgb = arr[:, :, ::-1]
+        im = Image.fromarray(rgb)
+        im = im.transpose(Image.FLIP_LEFT_RIGHT).resize((w, h), Image.Resampling.BILINEAR)
+        out_rgb = np.asarray(im, dtype=np.uint8)
+        return out_rgb[:, :, ::-1].copy()
+
+
 app = Flask(__name__)
 # CORS: this API is called from multiple deployed frontends (Vercel, local dev, etc).
 # We don't rely on cookies; auth is via bearer tokens, so we can safely allow any origin.
@@ -462,18 +487,14 @@ class DetectionSession:
         return max(0.0, min(held / AUTO_COMMIT_HOLD_SECONDS, 1.0))
 
     def process_frame(self, frame_bgr: np.ndarray) -> None:
-        import cv2
         import numpy as np
 
         if not self.active:
             return
 
         # Match `letter_interpreter.py` / supportbackend: mirrored webcam (selfie view).
-        frame_bgr = cv2.flip(frame_bgr, 1)
-        frame_bgr = cv2.resize(
-            frame_bgr,
-            (INFERENCE_FRAME_W, INFERENCE_FRAME_H),
-            interpolation=cv2.INTER_AREA,
+        frame_bgr = _mirror_and_resize_bgr(
+            frame_bgr, INFERENCE_FRAME_W, INFERENCE_FRAME_H
         )
 
         if self.keypoint_engine is not None:
@@ -645,7 +666,27 @@ def _load_model_worker() -> None:
         _model_ready.set()
 
 
-if _RUNNING_ON_VERCEL:
+def _e2e_mock_model_install() -> None:
+    """
+    Smoke tests / CI: skip TensorFlow/MediaPipe import chain.
+    Set KSL_E2E_MOCK=1 before importing this module (see tools/test_multisession_api.py).
+    """
+    global _session, _load_error, SIGN_DETECTOR_KIND
+
+    class _MockKeypointEngine:
+        def predict_frame(self, frame_bgr: object, frame_w: int, frame_h: int) -> tuple[str, float]:
+            return "a", 0.95
+
+    _load_error = None
+    SIGN_DETECTOR_KIND = "e2e_mock"
+    _session = DetectionSession(None, _MockKeypointEngine())
+    add_log("KSL_E2E_MOCK=1 — mock keypoint engine (API session tests only).")
+    _model_ready.set()
+
+
+if os.getenv("KSL_E2E_MOCK", "").strip().lower() in ("1", "true", "yes"):
+    _e2e_mock_model_install()
+elif _RUNNING_ON_VERCEL:
     _load_error = (
         "Sign detection is disabled on Vercel because the required CV/ML "
         "dependencies exceed the 500MB serverless storage limit."
@@ -1535,7 +1576,10 @@ def analyze_frame() -> tuple[str, int]:
                     ),
                     413,
                 )
-            decoded = np.frombuffer(binary, dtype=np.uint8)
+            # ascontiguousarray: some OpenCV builds reject ndarray views from frombuffer
+            decoded = np.ascontiguousarray(
+                np.frombuffer(binary, dtype=np.uint8), dtype=np.uint8
+            )
         except Exception as exc:
             return (
                 jsonify(
@@ -1548,16 +1592,34 @@ def analyze_frame() -> tuple[str, int]:
             )
 
         import cv2
-        frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
+
+        frame = None
+        try:
+            if decoded.size:
+                frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
+        except cv2.error:
+            frame = None
         if frame is None:
-            return (
-                jsonify(
-                    {
-                        "error": "Could not decode frame as image (imdecode returned None). Check JPEG/PNG data.",
-                    }
-                ),
-                400,
-            )
+            # Some Windows installs ship OpenCV wheels incompatible with NumPy buffers; Pillow decodes reliably.
+            try:
+                from io import BytesIO
+
+                from PIL import Image
+
+                im = Image.open(BytesIO(binary)).convert("RGB")
+                rgb = np.asarray(im, dtype=np.uint8)
+                # BGR for downstream cv2.flip / resize (avoid cv2.cvtColor when cv2/numpy ABI is broken)
+                frame = rgb[:, :, ::-1].copy()
+            except Exception as exc2:
+                return (
+                    jsonify(
+                        {
+                            "error": "Could not decode frame as image.",
+                            "detail": str(exc2),
+                        }
+                    ),
+                    400,
+                )
 
         sess.process_frame(frame)
         with sess.lock:
