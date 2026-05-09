@@ -87,6 +87,43 @@ SIGN_DETECTOR_KIND: str = "loading"
 _RUNNING_ON_VERCEL = bool(os.getenv("VERCEL", "").strip())
 
 
+def _vision_runtime_ok() -> tuple[bool, str]:
+    """
+    Best-effort import check for the CV/ML stack used by camera/sign detection.
+
+    Auth + non-vision endpoints should still work when this fails.
+    """
+    try:
+        import numpy as np  # noqa: F401
+    except Exception as exc:
+        return (
+            False,
+            "Vision runtime unavailable: NumPy failed to import "
+            f"({type(exc).__name__}: {exc}). "
+            "This usually means a broken/ABI-mismatched wheel on the server. "
+            "Recreate the venv and ensure Python 3.11/3.12 with numpy==1.26.4.",
+        )
+    try:
+        import cv2  # noqa: F401
+    except Exception as exc:
+        return (
+            False,
+            "Vision runtime unavailable: OpenCV failed to import "
+            f"({type(exc).__name__}: {exc}). "
+            "Install a compatible opencv-python wheel or use a container image with the needed system libs.",
+        )
+    try:
+        import mediapipe  # noqa: F401
+    except Exception as exc:
+        return (
+            False,
+            "Vision runtime unavailable: MediaPipe failed to import "
+            f"({type(exc).__name__}: {exc}). "
+            "Ensure mediapipe and protobuf versions are compatible (protobuf<5 for mediapipe 0.10.x).",
+        )
+    return True, ""
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -220,7 +257,7 @@ def load_letter_model() -> Pipeline:
     # "Vercel-lite" configuration without bundling large wheels.
     import joblib
     import numpy as np
-    import pandas as pd
+    import csv
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
@@ -230,14 +267,28 @@ def load_letter_model() -> Pipeline:
         add_log("Loaded cached letter model.")
         return model
 
-    base_data = pd.read_csv(ROOT / "hand_signals.csv")
-    base_data = base_data.loc[:, ~base_data.columns.str.contains("^Unnamed")]
-    if "letter" not in base_data.columns:
-        raise RuntimeError("hand_signals.csv is missing required 'letter' column.")
+    csv_path = ROOT / "hand_signals.csv"
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise RuntimeError("hand_signals.csv is empty or missing headers.")
+        if "letter" not in reader.fieldnames:
+            raise RuntimeError("hand_signals.csv is missing required 'letter' column.")
+        feature_cols = [
+            c
+            for c in reader.fieldnames
+            if c != "letter" and not str(c).startswith("Unnamed")
+        ]
+        if not feature_cols:
+            raise RuntimeError("hand_signals.csv has no feature columns.")
+        x_rows: list[list[float]] = []
+        y_rows: list[str] = []
+        for row in reader:
+            y_rows.append(str((row.get("letter") or "")).strip().lower())
+            x_rows.append([float(row.get(c, 0.0) or 0.0) for c in feature_cols])
 
-    data = base_data
-    x_data = data.drop("letter", axis=1).astype(np.float32)
-    y_data = data["letter"].astype(str).str.lower()
+    x_data = np.asarray(x_rows, dtype=np.float32)
+    y_data = np.asarray(y_rows, dtype=str)
 
     model = Pipeline(
         steps=[
@@ -522,16 +573,36 @@ def _load_model_worker() -> None:
     try:
         SIGN_DETECTOR_KIND = "loading"
         add_log("Loading sign model (first run may train and take a minute)...")
+        ok, msg = _vision_runtime_ok()
+        if not ok:
+            _load_error = msg
+            SIGN_DETECTOR_KIND = "failed"
+            add_log(f"Model load skipped: {msg}")
+            return
         sess = _try_keypoint_session()
         if sess is not None:
             _session = sess
             SIGN_DETECTOR_KIND = "keypoint_tflite"
             add_log("Using TFLite keypoint classifier (supportbackend pipeline).")
         else:
+            enable_legacy = os.getenv("ENABLE_SKLEARN_FALLBACK", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if not enable_legacy:
+                raise RuntimeError(
+                    "Sign model unavailable: keypoint ASL engine could not start "
+                    "(install tensorflow for the TFLite runtime), and the sklearn "
+                    "fallback is disabled. To enable the fallback, set "
+                    "ENABLE_SKLEARN_FALLBACK=1 and install the legacy deps."
+                )
             model = load_letter_model()
             _session = DetectionSession(model, None)
             SIGN_DETECTOR_KIND = "sklearn_legacy"
-            add_log("Using scikit-learn letter model (letter_model.joblib / hand_signals).")
+            add_log(
+                "Using scikit-learn letter model (letter_model.joblib / hand_signals)."
+            )
         add_log("Model ready — you can start a session from the UI.")
     except Exception as exc:
         _load_error = str(exc)

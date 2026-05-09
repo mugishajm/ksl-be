@@ -117,7 +117,8 @@ If login works but sign detection fails with `MediaPipe solutions API is unavail
 1. This repo includes `runtime.txt` with `python-3.11.9`.
 2. In Render environment variables, set:
    - `DATABASE_URL=<your Mongo URI>`
-   - `USE_LEGACY_SIGN_MODEL=1` (optional fallback if keypoint/MediaPipe path fails)
+   - (recommended) install TensorFlow so the keypoint TFLite model can run: `pip install tensorflow`
+   - (optional) `ENABLE_SKLEARN_FALLBACK=1` + `USE_LEGACY_SIGN_MODEL=1` if you explicitly want the legacy sklearn path
 3. Start command:
 
    ```
@@ -130,11 +131,30 @@ If login works but sign detection fails with `MediaPipe solutions API is unavail
 
 The API picks a detector automatically:
 
-1. **Keypoint TFLite (recommended)** — If `supportbackend/American-Sign-Language-Detection/model/keypoint_classifier/keypoint_classifier.tflite` and `keypoint_classifier_label.csv` exist **and** TensorFlow (or `tflite-runtime`) loads, the server uses the same pipeline as that project: MediaPipe → wrist-relative normalized landmarks → TFLite (ASL **A–Z**). `requirements.txt` includes **`tensorflow`** (works on most Windows/macOS/Linux with **Python 3.11–3.12**). If TensorFlow has no wheel for your Python version, install **`tflite-runtime`** when available, or rely on the sklearn fallback below.
+1. **Keypoint TFLite (recommended)** — If `supportbackend/American-Sign-Language-Detection/model/keypoint_classifier/keypoint_classifier.tflite` and `keypoint_classifier_label.csv` exist **and** TensorFlow (or `tflite-runtime`) loads, the server uses the same pipeline as that project: MediaPipe → wrist-relative normalized landmarks → TFLite (ASL **A–Z**).
 
-2. **Sklearn legacy** — If the keypoint bundle is missing or fails to load, the API uses `letter_model.joblib` (or trains from `hand_signals.csv` on first run).
+   Install a runtime for the TFLite model:
 
-Force the sklearn path only:
+   ```
+   pip install tensorflow
+   ```
+
+   If TensorFlow has no wheel for your Python/platform, install **`tflite-runtime`** when available.
+
+2. **Sklearn legacy (optional)** — Disabled by default because compiled wheels can be fragile on some servers. To enable it, set:
+
+   ```
+   $env:ENABLE_SKLEARN_FALLBACK="1"
+   $env:USE_LEGACY_SIGN_MODEL="1"
+   ```
+
+   Then install the legacy deps (not included in `requirements.txt`):
+
+   ```
+   pip install scikit-learn scipy joblib
+   ```
+
+Force the legacy path only:
 
 ```
 $env:USE_LEGACY_SIGN_MODEL="1"

@@ -16,10 +16,6 @@ import threading
 from pathlib import Path
 from typing import Any, List, Tuple
 
-import cv2
-import mediapipe as mp
-import numpy as np
-
 try:
     import tflite_runtime.interpreter as tflite_rt  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
@@ -37,6 +33,8 @@ def _solutions_module():
     - classic: mediapipe.solutions (via mp.solutions)
     - some newer/minimal wheels: mediapipe.python.solutions only
     """
+    import mediapipe as mp  # imported lazily so module import can succeed without vision deps
+
     sol = getattr(mp, "solutions", None)
     if sol is not None:
         return sol
@@ -61,8 +59,10 @@ def asl_keypoint_assets_exist(repo_root: Path) -> bool:
 
 
 def calc_landmark_list(
-    image: np.ndarray, landmarks: object
+    image: "np.ndarray", landmarks: object
 ) -> List[List[int]]:
+    import numpy as np
+
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_point: List[List[int]] = []
     for _, landmark in enumerate(landmarks.landmark):
@@ -112,6 +112,10 @@ class KeypointAslEngine:
     """TFLite keypoint classifier + MediaPipe (matches supportbackend app.py)."""
 
     def __init__(self, repo_root: Path) -> None:
+        import cv2  # noqa: F401
+        import mediapipe  # noqa: F401
+        import numpy as np  # noqa: F401
+
         self._base = _asl_bundle_root(repo_root)
         tflite_path = self._base / "model" / "keypoint_classifier" / "keypoint_classifier.tflite"
         labels_path = self._base / "model" / "keypoint_classifier" / "keypoint_classifier_label.csv"
@@ -135,7 +139,7 @@ class KeypointAslEngine:
 
     def predict_frame(
         self,
-        frame_bgr: np.ndarray,
+        frame_bgr: "np.ndarray",
         frame_w: int,
         frame_h: int,
     ) -> Tuple[str, float]:
@@ -143,6 +147,9 @@ class KeypointAslEngine:
         frame_bgr: already flipped + resized to (frame_w, frame_h).
         Returns (letter_lowercase, confidence in [0,1]).
         """
+        import cv2
+        import numpy as np
+
         with self._lock:
             image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
