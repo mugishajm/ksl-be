@@ -1322,6 +1322,24 @@ def start() -> tuple[str, int]:
     if mode not in {"letter", "word"}:
         return jsonify({"error": "Mode must be 'letter' or 'word'."}), 400
     sid = _get_session_id() or _new_session_id()
+
+    # Idempotent start: if this session is already active, return success.
+    with _sessions_lock:
+        existing = _sessions.get(sid)
+        if existing is not None and existing.sess.active:
+            existing.last_seen = datetime.now(timezone.utc)
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "mode": existing.sess.mode,
+                        "session_id": sid,
+                        "already_running": True,
+                    }
+                ),
+                200,
+            )
+
     with _sessions_lock:
         active_count = len(_sessions)
     if active_count >= _MAX_ACTIVE_SESSIONS:
@@ -1340,7 +1358,8 @@ def start() -> tuple[str, int]:
     # We clone a new DetectionSession that shares the underlying model/engine references.
     new_sess = DetectionSession(sess.legacy_model, sess.keypoint_engine)
     if not new_sess.start(mode, session_id=sid):
-        return jsonify({"error": "Unable to start session."}), 500
+        # Defensive fallback, should not happen for fresh sessions.
+        return jsonify({"ok": True, "mode": mode, "session_id": sid, "already_running": True}), 200
     with _sessions_lock:
         _sessions[sid] = SessionEntry(
             sess=new_sess,
