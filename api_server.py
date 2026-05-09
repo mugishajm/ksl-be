@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import uuid
 import unicodedata
 import sys
@@ -34,6 +35,26 @@ else:
 ROOT = Path(__file__).resolve().parent
 MODEL_CACHE = ROOT / "letter_model.joblib"
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
 # Fail fast on unsupported Python versions to avoid confusing NumPy/OpenCV build errors.
 if sys.version_info >= (3, 14):
     raise RuntimeError(
@@ -53,16 +74,16 @@ MIN_KEYPOINT_DISPLAY_CONFIDENCE = 0.2
 MIN_LETTER_COMMIT_CONFIDENCE = 0.5
 MIN_KEYPOINT_COMMIT_CONFIDENCE = 0.34
 # Consecutive agreeing frames required before appending to transcript (lower = faster, noisier).
-LETTER_COMMIT_STREAK = 4
+LETTER_COMMIT_STREAK = _env_int("LETTER_COMMIT_STREAK", 3)
 # Prevents repeated auto-commit of same held sign (seconds).
 SAME_LETTER_COOLDOWN_SECONDS = 0.9
 # User must hold a stable letter this long before auto-commit.
-AUTO_COMMIT_HOLD_SECONDS = 3.0
+AUTO_COMMIT_HOLD_SECONDS = _env_float("AUTO_COMMIT_HOLD_SECONDS", 1.4)
 # Keep current prediction for brief tracking dropouts (flicker reduction).
 NO_DETECTION_GRACE_FRAMES = 5
 # Require local consensus before feeding auto-commit streak.
 LETTER_STABILITY_WINDOW = 5
-LETTER_STABILITY_MIN_COUNT = 3
+LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 2)
 
 app = Flask(__name__)
 # CORS: this API is called from multiple deployed frontends (Vercel, local dev, etc).
@@ -128,8 +149,9 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def add_log(message: str) -> None:
-    logs.append(f"[{utc_now_iso()}] {message}")
+def add_log(message: str, session_id: Optional[str] = None) -> None:
+    prefix = f"[{session_id[:8]}] " if session_id else ""
+    logs.append(f"[{utc_now_iso()}] {prefix}{message}")
 
 
 def _mongo_enabled() -> bool:
@@ -346,7 +368,7 @@ class DetectionSession:
         self.hold_letter = ""
         self.hold_started_at: Optional[datetime] = None
 
-    def start(self, mode: str) -> bool:
+    def start(self, mode: str, session_id: str) -> bool:
         if self.active:
             return False
         self.mode = mode
@@ -362,13 +384,13 @@ class DetectionSession:
         self.hold_letter = ""
         self.hold_started_at = None
         self.active = True
-        add_log(f"Detection session started in {mode} mode.")
+        add_log(f"Detection session started in {mode} mode.", session_id=session_id)
         return True
 
-    def stop(self) -> None:
+    def stop(self, session_id: Optional[str] = None) -> None:
         self.active = False
         self.started_at = None
-        add_log("Detection session stopped.")
+        add_log("Detection session stopped.", session_id=session_id)
 
     def clear_text(self) -> None:
         with self.lock:
@@ -540,10 +562,15 @@ _sessions_lock = threading.Lock()
 class SessionEntry:
     sess: DetectionSession
     last_seen: datetime
+    in_flight: bool = False
+    last_frame_at_mono: float = 0.0
 
 
 _sessions: dict[str, SessionEntry] = {}
 _SESSION_TTL_SECONDS = 15 * 60
+_MAX_ACTIVE_SESSIONS = _env_int("MAX_ACTIVE_SESSIONS", 80)
+_MIN_FRAME_INTERVAL_SECONDS = _env_float("MIN_FRAME_INTERVAL_SECONDS", 0.14)
+_MAX_FRAME_BYTES = _env_int("MAX_FRAME_BYTES", 1_800_000)
 
 
 def _try_keypoint_session() -> Optional[DetectionSession]:
@@ -669,6 +696,38 @@ def _get_or_404_session() -> Tuple[Optional[DetectionSession], Optional[str], in
             return None, "Unknown or expired session_id. Call /api/start again.", 404
         entry.last_seen = datetime.now(timezone.utc)
         return entry.sess, None, 200
+
+
+def _frame_gate_begin(sid: str) -> tuple[bool, str]:
+    """
+    Controls per-session frame concurrency and rate.
+    Returns (accepted, reason) where reason is one of:
+      - "ok"
+      - "busy"      -> a previous frame is still being processed
+      - "throttled" -> frames are arriving too quickly
+      - "missing"   -> session expired/missing
+    """
+    now_mono = time.monotonic()
+    with _sessions_lock:
+        entry = _sessions.get(sid)
+        if entry is None:
+            return False, "missing"
+        if entry.in_flight:
+            return False, "busy"
+        elapsed = now_mono - entry.last_frame_at_mono
+        if elapsed < _MIN_FRAME_INTERVAL_SECONDS:
+            return False, "throttled"
+        entry.in_flight = True
+        entry.last_seen = datetime.now(timezone.utc)
+        return True, "ok"
+
+
+def _frame_gate_end(sid: str) -> None:
+    with _sessions_lock:
+        entry = _sessions.get(sid)
+        if entry is not None:
+            entry.in_flight = False
+            entry.last_frame_at_mono = time.monotonic()
 
 
 def _cleanup_sessions_worker() -> None:
@@ -1263,13 +1322,32 @@ def start() -> tuple[str, int]:
     if mode not in {"letter", "word"}:
         return jsonify({"error": "Mode must be 'letter' or 'word'."}), 400
     sid = _get_session_id() or _new_session_id()
+    with _sessions_lock:
+        active_count = len(_sessions)
+    if active_count >= _MAX_ACTIVE_SESSIONS:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Server is busy. Too many active sessions right now. "
+                        "Please retry in a few seconds."
+                    )
+                }
+            ),
+            429,
+        )
     # Create per-user session bound to the already-loaded model assets.
     # We clone a new DetectionSession that shares the underlying model/engine references.
     new_sess = DetectionSession(sess.legacy_model, sess.keypoint_engine)
-    if not new_sess.start(mode):
+    if not new_sess.start(mode, session_id=sid):
         return jsonify({"error": "Unable to start session."}), 500
     with _sessions_lock:
-        _sessions[sid] = SessionEntry(sess=new_sess, last_seen=datetime.now(timezone.utc))
+        _sessions[sid] = SessionEntry(
+            sess=new_sess,
+            last_seen=datetime.now(timezone.utc),
+            in_flight=False,
+            last_frame_at_mono=0.0,
+        )
     return jsonify({"ok": True, "mode": mode, "session_id": sid}), 200
 
 
@@ -1279,9 +1357,9 @@ def stop() -> tuple[str, int]:
     if sess is None:
         # Stop should be idempotent for the UI.
         return jsonify({"ok": True, "was_running": False, "error": err_msg}), 200
-    if sess.active:
-        sess.stop()
     sid = _get_session_id()
+    if sess.active:
+        sess.stop(session_id=sid)
     if sid:
         with _sessions_lock:
             _sessions.pop(sid, None)
@@ -1302,45 +1380,84 @@ def analyze_frame() -> tuple[str, int]:
             ),
             501,
         )
+    sid = _get_session_id()
     sess, err_msg, code = _get_or_404_session()
     if sess is None:
         return jsonify({"error": err_msg}), code
     if not sess.active:
         return jsonify({"error": "Session is not running."}), 409
+    if not sid:
+        return jsonify({"error": "Missing session_id. Call /api/start first."}), 400
 
-    data = request.get_json(silent=True) or {}
-    frame_data = data.get("image")
-    if not isinstance(frame_data, str) or "," not in frame_data:
-        return jsonify({"error": "Invalid image payload."}), 400
+    accepted, reason = _frame_gate_begin(sid)
+    if not accepted:
+        if reason == "missing":
+            return jsonify({"error": "Unknown or expired session_id. Call /api/start again."}), 404
+        with sess.lock:
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "skip_reason": reason,
+                        "text": sess.detected_text,
+                        "current_letter": sess.current_letter,
+                        "confidence": sess.current_confidence,
+                        "hold_progress": sess.hold_progress(),
+                        "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
+                    }
+                ),
+                200,
+            )
 
     try:
-        import numpy as np
-        encoded = frame_data.split(",", 1)[1]
-        binary = base64.b64decode(encoded)
-        decoded = np.frombuffer(binary, dtype=np.uint8)
-    except Exception:
-        return jsonify({"error": "Invalid image encoding."}), 400
+        data = request.get_json(silent=True) or {}
+        frame_data = data.get("image")
+        if not isinstance(frame_data, str) or "," not in frame_data:
+            return jsonify({"error": "Invalid image payload."}), 400
 
-    import cv2
-    frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
-    if frame is None:
-        return jsonify({"error": "Could not decode frame."}), 400
+        try:
+            import numpy as np
+            encoded = frame_data.split(",", 1)[1]
+            binary = base64.b64decode(encoded)
+            if len(binary) > _MAX_FRAME_BYTES:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"Frame too large ({len(binary)} bytes). "
+                                "Reduce image resolution/quality."
+                            )
+                        }
+                    ),
+                    413,
+                )
+            decoded = np.frombuffer(binary, dtype=np.uint8)
+        except Exception:
+            return jsonify({"error": "Invalid image encoding."}), 400
 
-    sess.process_frame(frame)
-    with sess.lock:
-        return (
-            jsonify(
-                {
-                    "ok": True,
-                    "text": sess.detected_text,
-                    "current_letter": sess.current_letter,
-                    "confidence": sess.current_confidence,
-                    "hold_progress": sess.hold_progress(),
-                    "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
-                }
-            ),
-            200,
-        )
+        import cv2
+        frame = cv2.imdecode(decoded, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({"error": "Could not decode frame."}), 400
+
+        sess.process_frame(frame)
+        with sess.lock:
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "text": sess.detected_text,
+                        "current_letter": sess.current_letter,
+                        "confidence": sess.current_confidence,
+                        "hold_progress": sess.hold_progress(),
+                        "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
+                    }
+                ),
+                200,
+            )
+    finally:
+        _frame_gate_end(sid)
 
 
 _commons_url_cache: dict[str, Optional[str]] = {}
