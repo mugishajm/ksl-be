@@ -6,8 +6,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.linear_model import LogisticRegression
 import time
+import io   
+# pyrefly: ignore [missing-import]
 from gtts import gTTS
-import io
 import pygame
 import warnings
 
@@ -64,7 +65,6 @@ def main():
     Returns: None
     '''
     
-    #Initializes variables, hand detector, video, and timer 
     pygame.mixer.init()
     signal_data = {}
     cap = cv2.VideoCapture(0)
@@ -75,56 +75,41 @@ def main():
     start = time.time()
     end = time.time()
 
-    #While loop for running the interpreter
     while True:
-        #Initialize image from the camera
         success, img = cap.read()
         img = cv2.flip(img, 1)
         key = cv2.waitKey(1) & 0xFF
 
-        #Initializes hand finder and position finder from handDetector class
         img = detector.find_hands(img, draw=False)
         landmarks = detector.find_position(img)
         
-        #Confidence threshold for Regressor model
         confidence_threshold = .7
 
-        #Checks if hands aren't detected
         if not landmarks:
 
-            #Starts inactivity timer
             start = time.time()
             idle_timer = start-end
 
-            #Checks if inactivity timer has exceeded three seconds
             if idle_timer >= 3 and word != '':
 
-                #Checks if there is a word to dictate
                 if word[-1] != ' ':
                     
-                    #Dictates the word and adds it to the words list
                     speech(word)
                     words.append(word)
                     word =word + ' '
 
-        #Checks if there is only one hand detected
         if landmarks and len(landmarks) == 1:
             
-            #Initialize landmark list
             lmlist = landmarks[0][1]
             
-            #Stops inactivity timer 
             end = time.time()
 
-            #Finds the highest and lowest points of each hand to draw the rectangle around the hand
             p1 = (min(lmlist[x][1] for x in range(len(lmlist))) - 25, min(lmlist[x][2] for x in range(len(lmlist))) - 25)
             p2 = (max(lmlist[x][1] for x in range(len(lmlist))) + 25, max(lmlist[x][2] for x in range(len(lmlist))) + 25)
             cv2.rectangle(img, p1, p2, (255,255,255), 3)
 
-            #Creates a location vector based on the coordiantes from the landmark list
             location_vector = np.array([coord for lm in lmlist for coord in lm[1:3]]).reshape(1, -1)
             
-            #Displays letter if the model confidence is above the confidence threshold
             probabilities = model.predict_proba(location_vector)
             max_prob = np.max(probabilities)
             if max_prob > confidence_threshold:
@@ -135,16 +120,12 @@ def main():
                     letters = [predicted_letter]
                 cv2.putText(img, predicted_letter, (p1[0], p1[1] - 10), cv2.QT_FONT_NORMAL, 3, (255, 255, 255), 3)
             
-            #If the same letter has been displayed for 20 frames, add it to the word
             if len(letters) == 20:
                 word = word + letters[0]
                 letters = [0]
                 print(word)
-
-        #Show the image
         cv2.imshow("Image", img)
 
-        #If c is pressed, capture the location of all the landmarks
         if key == ord('c') and lmlist:
             for item in lmlist:
                 if f'{item[0]}x' in signal_data:

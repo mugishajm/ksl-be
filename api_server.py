@@ -72,18 +72,18 @@ MIN_LETTER_DISPLAY_CONFIDENCE = 0.3
 MIN_KEYPOINT_DISPLAY_CONFIDENCE = 0.2
 # Higher thresholds for stable/commit logic.
 MIN_LETTER_COMMIT_CONFIDENCE = 0.5
-MIN_KEYPOINT_COMMIT_CONFIDENCE = 0.34
+MIN_KEYPOINT_COMMIT_CONFIDENCE = 0.25
 # Consecutive agreeing frames required before appending to transcript (lower = faster, noisier).
-LETTER_COMMIT_STREAK = _env_int("LETTER_COMMIT_STREAK", 3)
+LETTER_COMMIT_STREAK = _env_int("LETTER_COMMIT_STREAK", 1)
 # Prevents repeated auto-commit of same held sign (seconds).
-SAME_LETTER_COOLDOWN_SECONDS = 0.9
+SAME_LETTER_COOLDOWN_SECONDS = 0.3
 # User must hold a stable letter this long before auto-commit.
-AUTO_COMMIT_HOLD_SECONDS = _env_float("AUTO_COMMIT_HOLD_SECONDS", 1.4)
+AUTO_COMMIT_HOLD_SECONDS = _env_float("AUTO_COMMIT_HOLD_SECONDS", 0.5)
 # Keep current prediction for brief tracking dropouts (flicker reduction).
 NO_DETECTION_GRACE_FRAMES = 5
 # Require local consensus before feeding auto-commit streak.
-LETTER_STABILITY_WINDOW = 5
-LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 2)
+LETTER_STABILITY_WINDOW = 3
+LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 1)
 
 
 def _mirror_and_resize_bgr(frame_bgr: Any, w: int, h: int) -> Any:
@@ -596,7 +596,7 @@ _sessions: dict[str, SessionEntry] = {}
 _SESSION_TTL_SECONDS = _env_int("SESSION_TIMEOUT_SECONDS", 15 * 60)
 # Cap concurrent inference sessions (alias MAX_SESSIONS for ops docs).
 _MAX_ACTIVE_SESSIONS = _env_int("MAX_ACTIVE_SESSIONS", _env_int("MAX_SESSIONS", 100))
-_MIN_FRAME_INTERVAL_SECONDS = _env_float("MIN_FRAME_INTERVAL_SECONDS", 0.14)
+_MIN_FRAME_INTERVAL_SECONDS = _env_float("MIN_FRAME_INTERVAL_SECONDS", 0.05)
 _MAX_FRAME_BYTES = _env_int("MAX_FRAME_BYTES", 1_800_000)
 
 
