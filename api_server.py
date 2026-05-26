@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import runtime_bootstrap  # noqa: F401  # Windows DLL paths before TF/MediaPipe
+
 import base64
 import json
 import os
@@ -72,18 +74,24 @@ MIN_LETTER_DISPLAY_CONFIDENCE = 0.3
 MIN_KEYPOINT_DISPLAY_CONFIDENCE = 0.2
 # Higher thresholds for stable/commit logic.
 MIN_LETTER_COMMIT_CONFIDENCE = 0.5
-MIN_KEYPOINT_COMMIT_CONFIDENCE = 0.25
-# Consecutive agreeing frames required before appending to transcript (lower = faster, noisier).
-LETTER_COMMIT_STREAK = _env_int("LETTER_COMMIT_STREAK", 1)
-# Prevents repeated auto-commit of same held sign (seconds).
-SAME_LETTER_COOLDOWN_SECONDS = 0.3
-# User must hold a stable letter this long before auto-commit.
-AUTO_COMMIT_HOLD_SECONDS = _env_float("AUTO_COMMIT_HOLD_SECONDS", 0.5)
+MIN_KEYPOINT_COMMIT_CONFIDENCE = 0.35
+# Consecutive agreeing frames required before the hold timer runs (higher = fewer false commits).
+LETTER_COMMIT_STREAK = _env_int("LETTER_COMMIT_STREAK", 3)
+# User must hold one stable sign this long before auto-commit.
+AUTO_COMMIT_HOLD_SECONDS = _env_float("AUTO_COMMIT_HOLD_SECONDS", 3.0)
+# Min gap before the same letter may auto-commit again (defaults to full hold duration).
+SAME_LETTER_COOLDOWN_SECONDS = _env_float(
+    "SAME_LETTER_COOLDOWN_SECONDS", AUTO_COMMIT_HOLD_SECONDS
+)
 # Keep current prediction for brief tracking dropouts (flicker reduction).
 NO_DETECTION_GRACE_FRAMES = 5
+# Consecutive frames with no hand after a commit before another letter may auto-commit.
+RELEASE_FRAMES_AFTER_COMMIT = _env_int("RELEASE_FRAMES_AFTER_COMMIT", 10)
+# Minimum gap between any two auto-commits (prevents flicker double/triple letters).
+MIN_COMMIT_GAP_SECONDS = _env_float("MIN_COMMIT_GAP_SECONDS", 3.0)
 # Require local consensus before feeding auto-commit streak.
-LETTER_STABILITY_WINDOW = 3
-LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 1)
+LETTER_STABILITY_WINDOW = _env_int("LETTER_STABILITY_WINDOW", 5)
+LETTER_STABILITY_MIN_COUNT = _env_int("LETTER_STABILITY_MIN_COUNT", 4)
 
 
 def _mirror_and_resize_bgr(frame_bgr: Any, w: int, h: int) -> Any:
@@ -160,12 +168,30 @@ def _vision_runtime_ok() -> tuple[bool, str]:
         )
     try:
         import mediapipe  # noqa: F401
+        sol = getattr(mediapipe, "solutions", None)
+        if sol is None:
+            ver = getattr(mediapipe, "__version__", "unknown")
+            return (
+                False,
+                "Vision runtime unavailable: MediaPipe legacy Hands API is missing "
+                f"(installed mediapipe {ver}). "
+                "Pin mediapipe==0.10.21 in the project venv (0.10.30+ removed mp.solutions).",
+            )
     except Exception as exc:
+        msg = str(exc)
+        hint = (
+            "Ensure mediapipe==0.10.21 and protobuf<5 in .venv311 "
+            "(see ksl-be/requirements.txt)."
+        )
+        if sys.platform == "win32" and "msvcp140" in msg.lower():
+            hint = (
+                "Install Microsoft Visual C++ Redistributable (x64) and restart the "
+                "backend via .\\start_backend.ps1 so runtime_bootstrap can load System32 DLLs."
+            )
         return (
             False,
             "Vision runtime unavailable: MediaPipe failed to import "
-            f"({type(exc).__name__}: {exc}). "
-            "Ensure mediapipe and protobuf versions are compatible (protobuf<5 for mediapipe 0.10.x).",
+            f"({type(exc).__name__}: {exc}). {hint}",
         )
     return True, ""
 
@@ -392,6 +418,14 @@ class DetectionSession:
         self.recent_letters: Deque[str] = deque(maxlen=LETTER_STABILITY_WINDOW)
         self.hold_letter = ""
         self.hold_started_at: Optional[datetime] = None
+        self.block_repeat_until_release = False
+        self.frames_since_release = 0
+        self.hold_committed = False
+
+    def _reset_hold_timer(self) -> None:
+        self.hold_letter = ""
+        self.hold_started_at = None
+        self.hold_committed = False
 
     def start(self, mode: str, session_id: str) -> bool:
         if self.active:
@@ -406,8 +440,9 @@ class DetectionSession:
         self.last_commit_at = None
         self.no_detection_frames = 0
         self.recent_letters.clear()
-        self.hold_letter = ""
-        self.hold_started_at = None
+        self._reset_hold_timer()
+        self.block_repeat_until_release = False
+        self.frames_since_release = 0
         self.active = True
         add_log(f"Detection session started in {mode} mode.", session_id=session_id)
         return True
@@ -425,29 +460,45 @@ class DetectionSession:
             self.last_commit_at = None
             self.no_detection_frames = 0
             self.recent_letters.clear()
-            self.hold_letter = ""
-            self.hold_started_at = None
+            self._reset_hold_timer()
+            self.block_repeat_until_release = False
+            self.frames_since_release = 0
         add_log("Detected text cleared.")
 
+    def _clear_block_if_new_letter(self, stable_letter: str) -> None:
+        """After a commit, allow the next letter once the stable sign changes (no hand-off required)."""
+        if (
+            self.block_repeat_until_release
+            and stable_letter
+            and stable_letter != self.last_committed_letter
+        ):
+            self.block_repeat_until_release = False
+            self.frames_since_release = 0
+            self._reset_hold_timer()
+
     def _can_commit_letter(self, predicted_letter: str) -> bool:
-        """
-        Avoid repeated commits from one held hand pose.
-        Allows immediate commit for a different letter, but rate-limits same-letter repeats.
-        """
-        if predicted_letter != self.last_committed_letter:
-            return True
+        """Gate auto-commit: same letter needs hand release; different letter only needs min gap."""
+        if self.block_repeat_until_release:
+            return False
         if self.last_commit_at is None:
             return True
         elapsed = (datetime.now(timezone.utc) - self.last_commit_at).total_seconds()
-        return elapsed >= SAME_LETTER_COOLDOWN_SECONDS
+        gap = MIN_COMMIT_GAP_SECONDS
+        if predicted_letter == self.last_committed_letter:
+            gap = max(gap, SAME_LETTER_COOLDOWN_SECONDS)
+        return elapsed >= gap
 
     def _record_committed_letter(self, predicted_letter: str) -> None:
+        if not self._can_commit_letter(predicted_letter):
+            return
         self.detected_text += predicted_letter
         self.last_committed_letter = predicted_letter
         self.last_commit_at = datetime.now(timezone.utc)
         self.letter_buffer = []
-        self.hold_letter = ""
-        self.hold_started_at = None
+        self.hold_committed = True
+        self.block_repeat_until_release = True
+        self.frames_since_release = 0
+        self._reset_hold_timer()
 
     def _stable_letter(self, predicted_letter: str) -> Optional[str]:
         self.recent_letters.append(predicted_letter)
@@ -460,31 +511,49 @@ class DetectionSession:
     def _handle_detection_miss(self, confidence: float = 0.0) -> None:
         self.current_confidence = confidence
         self.no_detection_frames += 1
+        self.frames_since_release += 1
+        if self.frames_since_release >= RELEASE_FRAMES_AFTER_COMMIT:
+            self.block_repeat_until_release = False
         if self.no_detection_frames >= NO_DETECTION_GRACE_FRAMES:
             self.current_letter = ""
             self.letter_buffer = []
             self.recent_letters.clear()
-            self.hold_letter = ""
-            self.hold_started_at = None
+            self._reset_hold_timer()
+
+    def _required_hold_seconds(self) -> float:
+        return AUTO_COMMIT_HOLD_SECONDS
 
     def _update_hold_and_maybe_commit(self, stable_letter: str) -> None:
+        self._clear_block_if_new_letter(stable_letter)
+        if self.block_repeat_until_release or self.hold_committed:
+            return
+        if not self._can_commit_letter(stable_letter):
+            return
+
         now = datetime.now(timezone.utc)
         if self.hold_letter != stable_letter:
             self.hold_letter = stable_letter
             self.hold_started_at = now
-            return
-        if self.hold_started_at is None:
+            self.hold_committed = False
+        elif self.hold_started_at is None:
             self.hold_started_at = now
+            self.hold_committed = False
+
+        if self.hold_started_at is None:
             return
+
         hold_seconds = (now - self.hold_started_at).total_seconds()
-        if hold_seconds >= AUTO_COMMIT_HOLD_SECONDS and self._can_commit_letter(stable_letter):
+        if hold_seconds >= self._required_hold_seconds():
             self._record_committed_letter(stable_letter)
 
     def hold_progress(self) -> float:
         if not self.hold_letter or self.hold_started_at is None:
             return 0.0
+        required = self._required_hold_seconds()
+        if required <= 0:
+            return 1.0
         held = (datetime.now(timezone.utc) - self.hold_started_at).total_seconds()
-        return max(0.0, min(held / AUTO_COMMIT_HOLD_SECONDS, 1.0))
+        return max(0.0, min(held / required, 1.0))
 
     def process_frame(self, frame_bgr: np.ndarray) -> None:
         import numpy as np
@@ -513,19 +582,21 @@ class DetectionSession:
                     return
                 predicted_letter = letter
                 self.no_detection_frames = 0
+                if not self.block_repeat_until_release:
+                    self.frames_since_release = 0
                 self.current_confidence = max_prob
                 self.current_letter = predicted_letter
                 if max_prob <= MIN_KEYPOINT_COMMIT_CONFIDENCE:
                     self.letter_buffer = []
                     self.recent_letters.clear()
-                    self.hold_letter = ""
-                    self.hold_started_at = None
+                    self._reset_hold_timer()
                     return
                 stable_letter = self._stable_letter(predicted_letter)
                 self.current_letter = stable_letter or predicted_letter
                 if not stable_letter:
                     self.letter_buffer = []
                     return
+                self._clear_block_if_new_letter(stable_letter)
                 if self.letter_buffer and self.letter_buffer[-1] == stable_letter:
                     self.letter_buffer.append(stable_letter)
                 else:
@@ -556,19 +627,21 @@ class DetectionSession:
 
             predicted_letter = str(self.legacy_model.predict(location_vector)[0])
             self.no_detection_frames = 0
+            if not self.block_repeat_until_release:
+                self.frames_since_release = 0
             self.current_confidence = max_prob
             self.current_letter = predicted_letter
             if max_prob <= MIN_LETTER_COMMIT_CONFIDENCE:
                 self.letter_buffer = []
                 self.recent_letters.clear()
-                self.hold_letter = ""
-                self.hold_started_at = None
+                self._reset_hold_timer()
                 return
             stable_letter = self._stable_letter(predicted_letter)
             self.current_letter = stable_letter or predicted_letter
             if not stable_letter:
                 self.letter_buffer = []
                 return
+            self._clear_block_if_new_letter(stable_letter)
             if self.letter_buffer and self.letter_buffer[-1] == stable_letter:
                 self.letter_buffer.append(stable_letter)
             else:
@@ -684,17 +757,45 @@ def _e2e_mock_model_install() -> None:
     _model_ready.set()
 
 
-if os.getenv("KSL_E2E_MOCK", "").strip().lower() in ("1", "true", "yes"):
-    _e2e_mock_model_install()
-elif _RUNNING_ON_VERCEL:
-    _load_error = (
-        "Sign detection is disabled on Vercel because the required CV/ML "
-        "dependencies exceed the 500MB serverless storage limit."
-    )
-    SIGN_DETECTOR_KIND = "failed"
-    _model_ready.set()
-else:
+_model_loader_started = False
+_model_loader_lock = threading.Lock()
+_MODEL_LOAD_WAIT_SECONDS = _env_int("MODEL_LOAD_WAIT_SECONDS", 600)
+
+
+def _bootstrap_sign_model(*, blocking: bool) -> None:
+    """Start or run the sign-model loader (TensorFlow + MediaPipe + TFLite)."""
+    global _model_loader_started
+    if _model_ready.is_set():
+        return
+    if os.getenv("KSL_E2E_MOCK", "").strip().lower() in ("1", "true", "yes"):
+        _e2e_mock_model_install()
+        return
+    if _RUNNING_ON_VERCEL:
+        global _load_error, SIGN_DETECTOR_KIND
+        _load_error = (
+            "Sign detection is disabled on Vercel because the required CV/ML "
+            "dependencies exceed the 500MB serverless storage limit."
+        )
+        SIGN_DETECTOR_KIND = "failed"
+        _model_ready.set()
+        return
+
+    with _model_loader_lock:
+        if _model_loader_started:
+            if blocking:
+                _model_ready.wait(timeout=_MODEL_LOAD_WAIT_SECONDS)
+            return
+        _model_loader_started = True
+
+    if blocking:
+        _load_model_worker()
+        return
     threading.Thread(target=_load_model_worker, daemon=True, name="model-loader").start()
+
+
+# Hosted WSGI imports this module without __main__ — load in a background thread.
+if __name__ != "__main__":
+    _bootstrap_sign_model(blocking=False)
 
 
 def _backend_state() -> Tuple[Optional[DetectionSession], Optional[str], str]:
@@ -1319,7 +1420,7 @@ def get_prediction() -> tuple[str, int]:
                     "current_letter": sess.current_letter,
                     "confidence": sess.current_confidence,
                     "hold_progress": sess.hold_progress(),
-                    "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
+                    "hold_seconds_required": sess._required_hold_seconds(),
                     "status": "running" if sess.active else "idle",
                     "mode": sess.mode,
                     "backend": "ready",
@@ -1364,6 +1465,9 @@ def commit_letter() -> tuple[str, int]:
         sess.last_committed_letter = ch
         sess.last_commit_at = datetime.now(timezone.utc)
         sess.letter_buffer = []
+        sess.block_repeat_until_release = True
+        sess.frames_since_release = 0
+        sess._reset_hold_timer()
         text = sess.detected_text
     return jsonify({"ok": True, "text": text}), 200
 
@@ -1553,7 +1657,7 @@ def analyze_frame() -> tuple[str, int]:
                         "current_letter": sess.current_letter,
                         "confidence": sess.current_confidence,
                         "hold_progress": sess.hold_progress(),
-                        "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
+                        "hold_seconds_required": sess._required_hold_seconds(),
                     }
                 ),
                 200,
@@ -1631,7 +1735,7 @@ def analyze_frame() -> tuple[str, int]:
                         "current_letter": sess.current_letter,
                         "confidence": sess.current_confidence,
                         "hold_progress": sess.hold_progress(),
-                        "hold_seconds_required": AUTO_COMMIT_HOLD_SECONDS,
+                        "hold_seconds_required": sess._required_hold_seconds(),
                     }
                 ),
                 200,
@@ -1773,31 +1877,64 @@ def _translate_en_to_target(text: str, target: str) -> Optional[str]:
     """
     Best-effort translation via MyMemory (free tier, network required).
     target: 'fr' | 'rw'
+    Set MYMEMORY_EMAIL in the environment for a higher free quota.
     """
     if target not in ("fr", "rw"):
         return None
     stripped = text.strip()
     if not stripped:
         return stripped
+
     chunk = stripped[:450]
-    api_url = (
-        "https://api.mymemory.translated.net/get?"
-        + urllib.parse.urlencode({"q": chunk, "langpair": f"en|{target}"})
+    params: dict[str, str] = {
+        "q": chunk,
+        "langpair": f"en|{target}",
+        "mt": "1",
+    }
+    contact = os.getenv("MYMEMORY_EMAIL", "").strip()
+    if contact:
+        params["de"] = contact
+
+    api_url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode(
+        params
     )
     try:
         req = urllib.request.Request(
             api_url,
-            headers={"User-Agent": "SignLanguageInterpreter/1.0 (local; educational)"},
+            headers={"User-Agent": "KSLI-SignInterpreter/1.0 (educational)"},
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-        data = payload.get("responseData") or {}
-        translated = data.get("translatedText")
-        if isinstance(translated, str) and translated.strip():
-            return translated.strip()
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
-        pass
-    return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        add_log(f"Translation request failed ({target}): {exc}")
+        return None
+
+    if payload.get("quotaFinished"):
+        add_log("Translation quota finished (MyMemory). Set MYMEMORY_EMAIL for more quota.")
+        return None
+    status = payload.get("responseStatus")
+    if status not in (None, 200):
+        add_log(f"Translation API status {status} for target={target}.")
+        return None
+
+    data = payload.get("responseData") or {}
+    translated = data.get("translatedText")
+    if not isinstance(translated, str):
+        return None
+
+    cleaned = translated.strip()
+    if not cleaned:
+        return None
+    upper = cleaned.upper()
+    if (
+        upper.startswith("MYMEMORY")
+        or "QUOTA" in upper
+        or upper.startswith("AUTO ")
+        or "EMAIL ADDRESS" in upper
+    ):
+        add_log(f"Translation rejected by provider: {cleaned[:120]}")
+        return None
+    return cleaned
 
 
 @app.post("/api/translate")
@@ -1816,15 +1953,21 @@ def translate_detected() -> tuple[str, int]:
         return jsonify({"text": text, "fallback": False}), 200
     translated = _translate_en_to_target(text, target)
     if translated is None:
+        hint = (
+            "Could not reach the translation service. "
+            "Check internet on the machine running the backend, or set MYMEMORY_EMAIL "
+            "in the server environment for a higher free quota."
+        )
+        if target == "rw":
+            hint += " Showing detected English letters/words as recognized from signs."
+        else:
+            hint += " Showing detected text as recognized from signs."
         return (
             jsonify(
                 {
                     "text": text,
                     "fallback": True,
-                    "message": (
-                        "Translation unavailable (offline, quota, or unsupported). "
-                        "Showing detected text as recognized from signs."
-                    ),
+                    "message": hint,
                 }
             ),
             200,
@@ -1833,8 +1976,14 @@ def translate_detected() -> tuple[str, int]:
 
 
 if __name__ == "__main__":
-    # Hosted platforms (Render/Fly/etc.) require binding to 0.0.0.0 and the
-    # platform-provided PORT environment variable.
+    # Local dev: load vision stack before accepting traffic (avoids endless 503 warming-up).
+    print("Loading sign detection model (first run may take 1–2 minutes)...", flush=True)
+    _bootstrap_sign_model(blocking=True)
+    if _load_error:
+        print(f"Sign model failed to load:\n{_load_error}", flush=True)
+        raise SystemExit(1)
+    print(f"Sign model ready ({SIGN_DETECTOR_KIND}). Starting API...", flush=True)
+
     port_env = os.getenv("PORT")
     host = "0.0.0.0" if port_env else os.getenv("API_HOST", "0.0.0.0")
     port_raw = port_env or os.getenv("API_PORT", "5000")

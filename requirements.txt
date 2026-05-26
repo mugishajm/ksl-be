@@ -11,18 +11,12 @@ flask-cors>=4.0.1
 # (common server error: `numpy._core.multiarray failed to import`).
 numpy==1.26.4; python_version < "3.14"
 # Keep a single OpenCV wheel installed to avoid cv2/numpy ABI conflicts.
-# MediaPipe already pulls OpenCV; we pin contrib build explicitly for stability.
 opencv-contrib-python==4.11.0.86
-# MediaPipe + TensorFlow must agree on a protobuf major version.
-# Newer MediaPipe wheels work with protobuf 6/7 (required by TF 2.21+).
-mediapipe>=0.10.30
+# Legacy Hands API (mp.solutions.hands) required by keypoint_asl_engine; removed in 0.10.30+.
+mediapipe==0.10.21
 Pillow>=10.0.0
-# TensorFlow 2.21 requires protobuf >= 6.31.1.
-protobuf>=6.31.1,<8
+# mediapipe 0.10.21 requires protobuf 4.x; TF 2.17.x is compatible with the same range.
+protobuf>=4.25.3,<5
+tensorflow>=2.17.0,<2.18
 requests>=2.31.0
 pymongo>=4.8.0
-
-# Optional: Keypoint ASL (.tflite) runtime. Not required for the sklearn fallback.
-# If you want the TFLite path, install one of:
-# - tensorflow (preferred on Windows/macOS): `pip install tensorflow`
-# - tflite-runtime (when available for your Python/platform)

@@ -16,15 +16,23 @@ import threading
 from pathlib import Path
 from typing import Any, List, Tuple
 
+import runtime_bootstrap  # noqa: F401  # Windows DLL paths before TF/MediaPipe
+
 try:
     import tflite_runtime.interpreter as tflite_rt  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
     tflite_rt = None
 
-try:
-    import tensorflow as tf
-except ImportError:  # pragma: no cover
-    tf = None
+_tf = None
+
+
+def _tensorflow():
+    global _tf
+    if _tf is None:
+        import tensorflow as tf
+
+        _tf = tf
+    return _tf
 
 
 def _solutions_module():
@@ -96,9 +104,12 @@ def _make_interpreter(model_path: Path) -> Tuple[Any, str]:
     """Returns (interpreter, implementation name for logging)."""
     path_str = str(model_path)
     # Prefer TensorFlow first — tflite-runtime often has no wheel for newer Python versions.
-    if tf is not None:
+    try:
+        tf = _tensorflow()
         interp = tf.lite.Interpreter(model_path=path_str, num_threads=1)
         return interp, "tensorflow"
+    except ImportError:
+        pass
     if tflite_rt is not None:
         interp = tflite_rt.Interpreter(model_path=path_str, num_threads=1)
         return interp, "tflite_runtime"
